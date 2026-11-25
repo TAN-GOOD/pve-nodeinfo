@@ -22,6 +22,21 @@
   - `--doctor` / `--dry-run` / `--force` / `--uninstall` / `--version` / `--pkg` / `--mirror` 七个开关；
   - `--uninstall` 逻辑内联在脚本里，不依赖网络，即使发版页挂了也能卸载。
 
+- **国内源支持（`--cn` / `--source gitee`）**。国内用户无需梯子即可安装：
+
+  ```bash
+  curl -fsSL https://gitee.com/T510/pve-nodeinfo/raw/main/install-online.sh | bash -s -- --cn
+  ```
+
+  - 脚本与发布包都从 Gitee 取，版本查询走 `gitee.com/api/v5`；
+  - Gitee 上没有对应版本时，自动退回 `ghfast.top` / `gh-proxy.com` 等加速镜像，
+    内容仍需通过 SHA256 校验（Gitee 附件不提供 `digest` 字段，故回退到内置校验表）；
+  - 网络探测端点、失败排查提示均按下载源切换为「国内 / 国外」两套文案。
+
+### 变更
+
+- README 的「一句话安装」按网络环境拆成**国内版 / 国外版**两条命令，并附选择对照表。
+
 ## [1.2.0] - 2026-11-26
 
 ### 新增
