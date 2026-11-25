@@ -2,6 +2,38 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-11-26
+
+### 修复
+
+- **磁盘行误报「找不到硬盘，可能已直通或被卸载」**（v1.0.0 的主要缺陷）。
+  根因是 PVE 的 API worker 会降权为 `www-data`，而 `/dev/sdX` 权限为 `brw-rw---- root:disk`，`smartctl` 读不到设备、只返回 `Permission denied`，输出的 JSON 里没有 `model_name`；旧渲染器把「没有型号」直接判定为「硬盘不存在」，给出了完全错误的结论。
+- 渲染器不再把「没有型号」等同于「硬盘不存在」，改为区分四种场景：
+  `未知`（缓存未就绪）/ `未检测到该磁盘` / `无法读取 SMART（权限不足）` / `读取失败: <smartctl 原始信息>`。
+- 采集失败时不再用空结果覆盖上一次的有效数据，避免面板在「正常」与「未检测到」之间跳变。
+- 磁盘渲染器先处理空值再 `JSON.parse`，缓存文件暂时为空时不再落到「无法获得有效数据」。
+
+### 变更
+
+- 磁盘数据获取方式由「每次 API 请求执行 `smartctl`」改为 **root 预采集 + 面板只读缓存**：
+  新增 systemd timer 每 5 秒以 root 运行采集器，结果写入 `/run/pve-nodeinfo/sdN.json`（`0644`），
+  API 侧只读普通文件。**不配 sudo、不加 `disk` 组、不设 SUID**，权限面零变更。
+- `Nodes.pm` 中磁盘字段由反引号执行 `smartctl` 改为读取缓存文件。
+- 顺带降低开销：不再随每个浏览器标签页的轮询 fork `smartctl`（单次约 18KB JSON）。
+- `patch_pve_nodes.py` 新增生成 `/etc/pve-nodeinfo/disks.conf`；`--check` 扩展为同时检查两个采集器、设备清单、systemd 单元与缓存目录。
+- `install.sh` 增加 systemd 单元安装、缓存内容校验、**`www-data` 读权限校验**（失败即回滚），回滚流程覆盖单元与配置清理。
+- `uninstall.sh` 先停 timer 再还原文件，避免删掉缓存目录后被下一轮采集重建。
+- `README` 新增「工作原理与权限模型」章节，说明三种可选方案及本项目的取舍。
+
+### 新增文件
+
+- `scripts/pve-nodeinfo-collect`：SMART 采集器，读 `/etc/pve-nodeinfo/disks.conf`，写 `/run/pve-nodeinfo/`。
+- `systemd/pve-nodeinfo-collect.service`、`systemd/pve-nodeinfo-collect.timer`。
+
+### 升级说明
+
+- v1.0.0 → v1.1.0 必须：`sudo ./uninstall.sh`，再 `sudo ./install.sh`。安装脚本检测到已有标记会拒绝执行，防止叠加注入。
+
 ## [1.0.0] - 2026-11-26
 
 首个发布版本。

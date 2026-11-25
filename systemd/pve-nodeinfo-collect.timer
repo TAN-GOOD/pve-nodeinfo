@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect disk SMART data every 5 seconds for pve-nodeinfo
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=5
+AccuracySec=1s
+Unit=pve-nodeinfo-collect.service
+
+[Install]
+WantedBy=timers.target

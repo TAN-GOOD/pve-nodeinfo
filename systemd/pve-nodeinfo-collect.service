@@ -1,0 +1,11 @@
+[Unit]
+Description=pve-nodeinfo disk SMART cache collector
+Documentation=https://github.com/TAN-GOOD/pve-nodeinfo
+After=local-fs.target
+Before=pveproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pve-nodeinfo-collect
+Nice=10
+IOSchedulingClass=idle

@@ -2,20 +2,22 @@
 # -*- coding: utf-8 -*-
 """在 PVE 节点状态面板中增加 温度 / CPU 频率 / 磁盘信息 显示。
 
-本脚本只做两件事，且都带锚点断言，锚点不符立即退出：
-  1) 向 Nodes.pm 注入 3+N 个只读字段（N = 自动检测到的磁盘数）
-  2) 向 pvemanagerlib.js 的 pveNodeStatus items 数组注入对应显示项，并调整面板高度
+本脚本做三件事，全部带锚点断言，锚点不符立即退出、不改任何文件：
+  1) 生成 /etc/pve-nodeinfo/disks.conf（root 采集器与面板字段的对应关系）
+  2) 向 Nodes.pm 注入 2+N 个只读字段（N = 自动检测到的磁盘数）
+  3) 向 pvemanagerlib.js 的 pveNodeStatus items 数组注入显示项，并调整面板高度
 
 不做的事（与原版社区脚本的重要区别）：
   - 不修改 proxmoxlib.js（订阅弹窗）
   - 不设置任何 SUID 位
+  - 不给 www-data 加 sudo 权限或 disk 组
   - 不安装软件包、不加载 msr 模块
   - 不写 /tmp 临时文件
 
 用法：
   python3 patch_pve_nodes.py --dry-run    # 只打印将要做什么
   python3 patch_pve_nodes.py              # 实际打补丁
-  python3 patch_pve_nodes.py --check       # 检查当前状态
+  python3 patch_pve_nodes.py --check      # 检查当前安装状态
 """
 
 import argparse
@@ -26,7 +28,12 @@ import sys
 NODES_PM = "/usr/share/perl5/PVE/API2/Nodes.pm"
 MANAGER_JS = "/usr/share/pve-manager/js/pvemanagerlib.js"
 HELPER = "/usr/local/bin/pve-hwinfo.sh"
+COLLECTOR = "/usr/local/bin/pve-nodeinfo-collect"
 SMARTCTL = "/usr/sbin/smartctl"
+CONF_DIR = "/etc/pve-nodeinfo"
+DISKS_CONF = "/etc/pve-nodeinfo/disks.conf"
+RUNDIR = "/run/pve-nodeinfo"
+UNIT_DIR = "/etc/systemd/system"
 
 MARK = "pve-nodeinfo"
 LEGACY_MARKS = ("modbyshowtempfreq",)
@@ -97,18 +104,22 @@ def detect_disks():
     return disks
 
 
-def build_perl_block(disks):
-    lines = ["", "        #" + MARK]
-    lines.append('        $res->{thermalstate} = `%s thermal 2>/dev/null`;' % HELPER)
-    lines.append('        $res->{cpuFreq} = `%s cpu 2>/dev/null`;' % HELPER)
+def conf_text(disks):
+    lines = [
+        "# pve-nodeinfo 磁盘清单（由 install.sh 自动生成，勿手工编辑）",
+        "# 格式: <面板字段名>=<块设备>，字段名与 Nodes.pm 注入的 $res->{sdN} 一一对应",
+    ]
     for idx, disk in enumerate(disks):
-        lines.append("        $res->{sd%d} = `" % idx)
-        lines.append(
-            "        if [ -b %s ]; then %s %s -a -j 2>/dev/null; else echo '{}'; fi"
-            % (disk["dev"], SMARTCTL, disk["dev"])
-        )
-        lines.append("        `;")
+        lines.append("sd%d=%s" % (idx, disk["dev"]))
     return "\n".join(lines) + "\n"
+
+
+def write_disks_conf(disks):
+    if not os.path.isdir(CONF_DIR):
+        os.makedirs(CONF_DIR, 0o755)
+    with open(DISKS_CONF, "w", encoding="utf-8") as fh:
+        fh.write(conf_text(disks))
+    os.chmod(DISKS_CONF, 0o644)
 
 
 def disk_title(disk, idx):
@@ -116,149 +127,181 @@ def disk_title(disk, idx):
     return "%s%d" % (kind, idx)
 
 
-def build_js_block(disks):
-    blocks = []
+PERL_DISK_BLOCK = """        # SMART 数据由 pve-nodeinfo-collect.timer 以 root 预采集到 %(run)s/
+        # （API 请求运行在 www-data 身份下，无权直接读 /dev/sdX）
+        $res->{sd%(idx)d} = do {
+            my $f = '%(run)s/sd%(idx)d.json';
+            my $c = '';
+            if (open(my $fh, '<', $f)) { local $/; $c = <$fh>; close($fh); }
+            $c // '';
+        };
+"""
 
-    blocks.append(
-        """
-        //{mark}
-        {{
+
+def build_perl_block(disks):
+    lines = ["", "        #" + MARK]
+    lines.append('        $res->{thermalstate} = `%s thermal 2>/dev/null`;' % HELPER)
+    lines.append('        $res->{cpuFreq} = `%s cpu 2>/dev/null`;' % HELPER)
+    out = "\n".join(lines) + "\n"
+    for idx in range(len(disks)):
+        out += PERL_DISK_BLOCK % {"idx": idx, "run": RUNDIR}
+    return out
+
+
+JS_THERMAL = """
+        //%(mark)s
+        {
             itemId: 'thermal',
             colspan: 2,
             printBar: false,
             title: gettext('温度(°C)'),
             textField: 'thermalstate',
             value: '',
-            renderer: function (value) {{
-                try {{
-                    if (!value) {{
+            renderer: function (value) {
+                try {
+                    if (!value) {
                         return Proxmox.Utils.unknownText;
-                    }}
-                    let labels = {{
+                    }
+                    let labels = {
                         'CPU Package': 'CPU封装',
                         Board: '主板',
                         WLAN: '无线',
                         NVMe: 'NVMe',
                         Fan: '风扇',
-                    }};
+                    };
                     let parts = [];
-                    String(value).split('\\n').forEach(function (line) {{
+                    String(value).split('\\n').forEach(function (line) {
                         let s = line.trim();
-                        if (!s) {{
+                        if (!s) {
                             return;
-                        }}
+                        }
                         let m = s.match(/^(.+?):\\s*([+-]?[\\d.]+)$/);
-                        if (!m) {{
+                        if (!m) {
                             return;
-                        }}
+                        }
                         let name = labels[m[1]] || m[1];
-                        if (m[1] === 'Fan') {{
+                        if (m[1] === 'Fan') {
                             parts.push(name + ': ' + m[2] + ' RPM');
-                        }} else {{
+                        } else {
                             parts.push(name + ': ' + Number(m[2]).toFixed(0) + '°C');
-                        }}
-                    }});
+                        }
+                    });
                     return parts.length ? parts.join(' | ') : Proxmox.Utils.unknownText;
-                }} catch (e) {{
+                } catch (e) {
                     return Proxmox.Utils.unknownText;
-                }}
-            }},
-        }},
-        {{
+                }
+            },
+        },
+        {
             itemId: 'cpumhz',
             colspan: 2,
             printBar: false,
             title: gettext('CPU频率(GHz)'),
             textField: 'cpuFreq',
             value: '',
-            renderer: function (v) {{
-                try {{
-                    if (!v) {{
+            renderer: function (v) {
+                try {
+                    if (!v) {
                         return Proxmox.Utils.unknownText;
-                    }}
+                    }
                     let mhz = [];
                     let gov = '--';
                     let mn = '--';
                     let mx = '--';
-                    String(v).split('\\n').forEach(function (line) {{
+                    String(v).split('\\n').forEach(function (line) {
                         let s = line.trim();
                         let i = s.indexOf('=');
-                        if (i < 0) {{
+                        if (i < 0) {
                             return;
-                        }}
+                        }
                         let k = s.slice(0, i);
                         let val = s.slice(i + 1);
-                        if (k === 'mhz') {{
+                        if (k === 'mhz') {
                             mhz.push((Number(val) / 1000).toFixed(1));
-                        }} else if (k === 'gov') {{
+                        } else if (k === 'gov') {
                             gov = String(val).toUpperCase();
-                        }} else if (k === 'min') {{
+                        } else if (k === 'min') {
                             mn = (Number(val) / 1000).toFixed(1);
-                        }} else if (k === 'max') {{
+                        } else if (k === 'max') {
                             mx = (Number(val) / 1000).toFixed(1);
-                        }}
-                    }});
+                        }
+                    });
                     let freq = mhz.length ? mhz.join(' | ') : '--';
                     return freq + ' | MAX: ' + mx + ' | MIN: ' + mn + ' | 调速器: ' + gov;
-                }} catch (e) {{
+                } catch (e) {
                     return Proxmox.Utils.unknownText;
-                }}
-            }},
-        }},
-""".format(
-            mark=MARK
-        )
-    )
+                }
+            },
+        },
+""" % {"mark": MARK}
 
-    for idx, disk in enumerate(disks):
-        blocks.append(
-            """
-        {{
-            itemId: 'disk{idx}',
+JS_DISK = """
+        {
+            itemId: 'disk%(idx)d',
             colspan: 2,
             printBar: false,
-            title: gettext('{title}'),
-            textField: 'sd{idx}',
+            title: gettext('%(title)s'),
+            textField: 'sd%(idx)d',
             value: '',
-            renderer: function (value) {{
-                try {{
-                    let v = typeof value === 'string' ? JSON.parse(value) : value;
-                    if (!v) {{
+            renderer: function (value) {
+                try {
+                    if (value === undefined || value === null || !String(value).trim()) {
                         return Proxmox.Utils.unknownText;
-                    }}
-                    if (v.standy === true) {{
+                    }
+                    let v = typeof value === 'string' ? JSON.parse(value) : value;
+                    if (!v) {
+                        return Proxmox.Utils.unknownText;
+                    }
+                    if (v.standy === true) {
                         return '休眠中';
-                    }}
-                    let model = v.model_name;
-                    if (!model) {{
-                        return '找不到硬盘，可能已直通或被卸载';
-                    }}
-                    let text = model;
-                    let temp = v.temperature?.current;
-                    if (temp !== undefined) {{
+                    }
+                    // smartctl 的告警可能在顶层 messages，也可能在 smartctl.messages
+                    let msgs = []
+                        .concat(v.messages || [])
+                        .concat((v.smartctl || {}).messages || [])
+                        .map(function (m) { return (m && m.string) || ''; })
+                        .filter(function (s) { return s !== ''; })
+                        .join('；');
+                    if (!v.model_name) {
+                        if (/permission denied/i.test(msgs)) {
+                            return '无法读取 SMART（权限不足）';
+                        }
+                        if (!Object.keys(v).length) {
+                            return '未检测到该磁盘';
+                        }
+                        if (msgs) {
+                            return '读取失败: ' + msgs.slice(0, 60);
+                        }
+                        return '未获取到磁盘信息';
+                    }
+                    let text = v.model_name;
+                    let temp = v.temperature && v.temperature.current;
+                    if (temp !== undefined) {
                         text += ' | 温度: ' + temp + '°C';
-                    }}
-                    let pot = v.power_on_time?.hours;
+                    }
+                    let pot = v.power_on_time && v.power_on_time.hours;
                     let poth = v.power_cycle_count;
-                    if (pot !== undefined) {{
+                    if (pot !== undefined) {
                         text += ' | 通电: ' + pot + '时' + (poth ? ',次: ' + poth : '');
-                    }}
-                    let smart = v.smart_status?.passed;
-                    if (smart !== undefined) {{
+                    }
+                    let smart = v.smart_status && v.smart_status.passed;
+                    if (smart !== undefined) {
                         text += ' | SMART: ' + (smart ? '正常' : '警告!');
-                    }}
+                    }
                     return text;
-                }} catch (e) {{
-                    return '无法获得有效数据';
-                }}
-            }},
-        }},
-""".format(
-                idx=idx, title=disk_title(disk, idx)
-            )
-        )
+                } catch (e) {
+                    return Proxmox.Utils.unknownText;
+                }
+            },
+        },
+"""
 
-    return "\n".join(blocks)
+
+def build_js_block(disks):
+    out = JS_THERMAL
+    for idx, disk in enumerate(disks):
+        out += JS_DISK % {"idx": idx, "title": disk_title(disk, idx)}
+    return out
 
 
 def find_legacy(path, text):
@@ -279,8 +322,11 @@ def patch_nodes_pm(text, disks, dry):
 
     block = build_perl_block(disks)
     if dry:
-        return text, "将向 Nodes.pm 注入 %d 个字段" % (2 + len(disks))
-    return text.replace(NODES_ANCHOR, NODES_ANCHOR + block, 1), "Nodes.pm 注入 %d 个采集字段" % (
+        return text, "将注入 %d 个字段（温度/频率 + %d 个磁盘，读缓存文件）" % (
+            2 + len(disks),
+            len(disks),
+        )
+    return text.replace(NODES_ANCHOR, NODES_ANCHOR + block, 1), "注入 %d 个采集字段" % (
         2 + len(disks)
     )
 
@@ -360,7 +406,7 @@ def patch_manager_js(text, disks, dry):
     block = build_js_block(disks).strip("\n").split("\n")
     lines[close + 1 : close + 1] = [""] + block
 
-    note = "pvemanagerlib.js 插入 %d 个显示项，height %d -> %d" % (items, height_old, height_new)
+    note = "插入 %d 个显示项，height %d -> %d" % (items, height_old, height_new)
     if minheight_idx is None:
         note += "（未找到 minHeight，跳过）"
     else:
@@ -384,9 +430,34 @@ def do_check():
         else:
             print("未安装: %s" % path)
             ok = False
-    print("采集脚本: %s" % ("存在" if os.path.exists(HELPER) else "缺失"))
-    if not os.path.exists(HELPER):
+
+    for path, label in ((HELPER, "采集脚本"), (COLLECTOR, "SMART 采集器")):
+        exists = os.path.exists(path)
+        print("%s: %s (%s)" % (label, "存在" if exists else "缺失", path))
+        if not exists:
+            ok = False
+
+    if os.path.exists(DISKS_CONF):
+        entries = [
+            ln for ln in read_text(DISKS_CONF).splitlines() if ln.strip() and not ln.startswith("#")
+        ]
+        print("设备清单: %d 项 (%s)" % (len(entries), DISKS_CONF))
+    else:
+        print("设备清单: 缺失 (%s)" % DISKS_CONF)
         ok = False
+
+    for unit in ("pve-nodeinfo-collect.service", "pve-nodeinfo-collect.timer"):
+        exists = os.path.exists(os.path.join(UNIT_DIR, unit))
+        print("systemd 单元 %s: %s" % (unit, "存在" if exists else "缺失"))
+        if not exists:
+            ok = False
+
+    if os.path.isdir(RUNDIR):
+        print("缓存目录: 存在 (%s)" % RUNDIR)
+    else:
+        print("缓存目录: 缺失 (%s)" % RUNDIR)
+        ok = False
+
     return 0 if ok else 1
 
 
@@ -423,6 +494,8 @@ def main():
         )
     if not disks:
         print("  未检测到磁盘，仅显示温度与频率")
+    elif not os.path.exists(SMARTCTL):
+        print("  警告: 未找到 %s，磁盘信息将显示为「未知」" % SMARTCTL)
 
     plan = []
     new_nodes, msg_nodes = patch_nodes_pm(read_text(NODES_PM), disks, args.dry_run)
@@ -438,12 +511,16 @@ def main():
     plan.append((MANAGER_JS, new_js))
 
     if args.dry_run:
+        print("[%s]" % DISKS_CONF)
+        for line in conf_text(disks).splitlines():
+            print("  " + line)
         print("\n--dry-run：未写入任何文件")
         return 0
 
     for path, text in plan:
         write_atomic(path, text)
-    print("\n补丁已写入。")
+    write_disks_conf(disks)
+    print("\n补丁已写入，设备清单已生成。")
     return 0
 
 

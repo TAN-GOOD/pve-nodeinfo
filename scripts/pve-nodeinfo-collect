@@ -1,0 +1,58 @@
+#!/bin/bash
+# pve-nodeinfo 磁盘 SMART 采集器
+#
+# 由 pve-nodeinfo-collect.timer 以 root 身份每 5 秒调用一次，把每块盘的
+# `smartctl -a -j` 输出写入 /run/pve-nodeinfo/<字段名>.json（权限 0644）。
+#
+# 为什么需要它：
+#   PVE 处理 Web/API 请求的进程会被降权成 www-data，而 /dev/sdX 是 root:disk
+#   且权限 660，www-data 读不到设备，smartctl 只能返回 "Permission denied"。
+#   改由 root 预采集、面板侧只读普通文件，就不必给 www-data 任何额外权限
+#   （不加 sudo、不加 disk 组、不设 SUID）。
+#
+# 设备清单来自 /etc/pve-nodeinfo/disks.conf，由安装时自动扫描生成：
+#   sd0=/dev/sda
+#   sd1=/dev/nvme0n1
+
+set -u
+
+CONF=/etc/pve-nodeinfo/disks.conf
+OUT=/run/pve-nodeinfo
+SMARTCTL=/usr/sbin/smartctl
+
+install -d -m 0755 "$OUT" || exit 1
+[ -r "$CONF" ] || exit 0
+[ -x "$SMARTCTL" ] || exit 0
+
+while IFS='=' read -r key dev; do
+    case "$key" in
+        ''|\#*) continue ;;
+    esac
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    dev="$(printf '%s' "$dev" | tr -d '[:space:]')"
+    [ -n "$key" ] && [ -n "$dev" ] || continue
+
+    target="$OUT/$key.json"
+
+    # 设备真的不在了：明确写 {}，前端显示「未检测到该磁盘」
+    if [ ! -b "$dev" ]; then
+        printf '{}' >"$target"
+        chmod 0644 "$target"
+        continue
+    fi
+
+    tmp="$OUT/.$key.json.$$"
+    # smartctl 对部分 USB/RAID 卡会返回非 0，但仍输出有效 JSON，故忽略退出码
+    "$SMARTCTL" "$dev" -a -j >"$tmp" 2>/dev/null || true
+
+    if [ -s "$tmp" ]; then
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$target"
+    else
+        # 采集失败但设备仍在：保留上一次的有效数据，避免面板在
+        # 「正常」与「未检测到」之间来回跳变
+        rm -f "$tmp"
+    fi
+done <"$CONF"
+
+exit 0

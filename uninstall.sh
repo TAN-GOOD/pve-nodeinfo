@@ -6,6 +6,12 @@ set -euo pipefail
 NP=/usr/share/perl5/PVE/API2/Nodes.pm
 PJS=/usr/share/pve-manager/js/pvemanagerlib.js
 HELPER=/usr/local/bin/pve-hwinfo.sh
+COLLECTOR=/usr/local/bin/pve-nodeinfo-collect
+CONF_DIR=/etc/pve-nodeinfo
+RUNDIR=/run/pve-nodeinfo
+UNIT_DIR=/etc/systemd/system
+SERVICE=pve-nodeinfo-collect.service
+TIMER=pve-nodeinfo-collect.timer
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -21,38 +27,68 @@ if [ -z "$BK" ]; then
 fi
 
 if [ -z "$BK" ] || [ ! -f "$BK/pve-ui-files.tar.gz" ]; then
-    say "未找到可用的备份包。"
+    say "未找到可用的备份包：$NP / $PJS 无法自动还原。"
     say "可选方案（会联网下载官方包，需主机能访问软件源）："
     say "  apt install --reinstall pve-manager proxmox-widget-toolkit"
     say "  systemctl restart pvedaemon pveproxy"
-    die "中止"
+    say ""
+    say "以下清理步骤仍会执行（定时器、采集器、配置文件）："
+    BK=""
+else
+    say "使用备份: $BK"
 fi
-say "使用备份: $BK"
 
-# ---------- 还原 ----------
-step "还原 PVE 界面文件"
-tar xzf "$BK/pve-ui-files.tar.gz" -C /
-say "已还原 $NP"
-say "已还原 $PJS"
+# ---------- 先停定时器 ----------
+# 必须最先做：否则删掉 /run/pve-nodeinfo 后，下一轮采集又会把它建回来
+step "停用定时采集"
+if systemctl list-unit-files "$TIMER" >/dev/null 2>&1 &&
+   systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
+    systemctl disable --now "$TIMER" || true
+    say "已停用 $TIMER"
+else
+    say "定时器未启用，跳过"
+fi
+systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+rm -f "$UNIT_DIR/$SERVICE" "$UNIT_DIR/$TIMER"
+rm -f "$UNIT_DIR/timers.target.wants/$TIMER"
+systemctl daemon-reload
+say "已移除 systemd 单元"
 
-if [ -f "$BK/before.sha256" ]; then
-    if sha256sum -c "$BK/before.sha256" --quiet 2>/dev/null; then
-        say "校验通过：与安装前完全一致"
-    else
-        say "警告：校验不一致，备份文件可能已被改动"
+# ---------- 还原 PVE 界面文件 ----------
+if [ -n "$BK" ]; then
+    step "还原 PVE 界面文件"
+    tar xzf "$BK/pve-ui-files.tar.gz" -C /
+    say "已还原 $NP"
+    say "已还原 $PJS"
+    if [ -f "$BK/before.sha256" ]; then
+        if sha256sum -c "$BK/before.sha256" --quiet 2>/dev/null; then
+            say "校验通过：与安装前完全一致"
+        else
+            say "警告：校验不一致，备份文件可能已被改动"
+        fi
     fi
 fi
 
-# ---------- 移除采集脚本 ----------
-step "移除采集脚本"
-if [ -f "$HELPER" ]; then
-    rm -f "$HELPER"
-    say "已删除 $HELPER"
-else
-    say "采集脚本不存在，跳过"
+# ---------- 移除采集器与配置 ----------
+step "移除采集器与配置"
+for f in "$HELPER" "$COLLECTOR"; do
+    if [ -f "$f" ]; then
+        rm -f "$f"
+        say "已删除 $f"
+    else
+        say "$f 不存在，跳过"
+    fi
+done
+if [ -d "$CONF_DIR" ]; then
+    rm -rf "$CONF_DIR"
+    say "已删除 $CONF_DIR"
+fi
+if [ -d "$RUNDIR" ]; then
+    rm -rf "$RUNDIR"
+    say "已删除 $RUNDIR"
 fi
 
-# ---------- 清理标记检查 ----------
+# ---------- 确认标记已清除 ----------
 step "确认补丁标记已清除"
 if grep -q 'pve-nodeinfo' "$NP" "$PJS" 2>/dev/null; then
     say "警告：仍残留 pve-nodeinfo 标记，请检查备份是否正确"
@@ -70,7 +106,7 @@ systemctl is-active pvedaemon pveproxy 2>/dev/null | sed 's/^/    /' || true
 step "验证 API"
 if command -v pvesh >/dev/null 2>&1; then
     if pvesh get /nodes/localhost/status --output-format json 2>/dev/null | grep -q '"thermalstate"'; then
-        say "警告：temperature 字段仍存在，还原可能未生效"
+        say "警告：thermalstate 字段仍存在，还原可能未生效"
     else
         say "字段已移除，API 恢复原始状态"
     fi
@@ -81,6 +117,11 @@ cat <<EOF
 卸载完成。
 
 请在浏览器中按 Shift+F5 强制刷新，节点摘要面板将恢复原样。
+EOF
+
+if [ -n "$BK" ]; then
+    cat <<EOF
 备份目录保留在 $BK，确认无问题后可手动删除：
   rm -rf $BK
 EOF
+fi

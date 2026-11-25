@@ -1,6 +1,6 @@
 # 测试与验证记录
 
-本文记录 v1.0.0 在真机上的验证过程与结果。所有数据来自实际执行，非模拟。
+本文记录 v1.0.0 与 v1.1.0 在真机上的验证过程与结果。所有数据来自实际执行，非模拟。
 
 ---
 
@@ -54,7 +54,7 @@
 | 步骤 | 结果 |
 |---|---|
 | 环境检查 | 通过，识别 PVE 9.1.1 / python3 3.13.5 |
-| 磁盘检测 | 识别 1 块：`/dev/sda  固态  119GB  Great Wall GW560` |
+| 磁盘检测 | 识别 1 块：`/dev/sda  固态  119GB  SATA SSD` |
 | 备份 | 生成 `/root/pve-nodeinfo-backup-<时间戳>/`，含 tar + sha256 |
 | 部署采集器 | `/usr/local/bin/pve-hwinfo.sh` 0755 root:root |
 | 采集自检 | 输出 `Board: 27.8 / CPU Package: 55.0 / CPU0~3: 54~55` |
@@ -77,7 +77,7 @@
 [cpumhz] CPU频率(GHz)
    -> 3.0 | 2.9 | 3.0 | 3.0 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORMANCE
 [disk0] 固态硬盘0
-   -> Great Wall GW560 128GB | 温度: 30°C | 通电: 1306时,次: 9 | SMART: 正常
+   -> SATA SSD 119GB | 温度: 30°C | 通电: 1306时,次: 9 | SMART: 正常
 ```
 
 ### 边界测试
@@ -145,7 +145,106 @@ node --check pvemanagerlib.js   # 2.18MB 全文
 
 ---
 
-## 八、未覆盖项
+## 八、v1.1.0 回归测试（缓存方案）
+
+v1.0.0 发布后，真机上磁盘行显示「找不到硬盘，可能已直通或被卸载」，但硬盘完好。本节记录定位与修复后的回归结果。
+
+### 问题定位
+
+| 观测 | 结果 |
+|---|---|
+| `smartctl /dev/sda -a -j`（手工执行） | `rc=0`，型号齐全 |
+| `pvesh get /nodes/localhost/status`（root） | `sd0` = **17902 字节**，`model_name` 正常 |
+| `GET /api2/json/nodes/<node>/status`（Web，即使登录 root@pam） | `sd0` = **592 字节**，仅 `Permission denied` |
+| `ls -l /dev/sda` | `brw-rw---- root disk` |
+| `id www-data` | `uid=33 gid=33`，不在 `disk` 组 |
+| 连续 30 次采样 `model_name` | 一次不缺 → 稳定被拒，非间歇故障 |
+
+结论：PVE 的 API worker 降权为 `www-data`，读不到块设备；`smartctl` 输出的 JSON 缺少 `model_name`，旧渲染器因此误判为「硬盘不存在」。
+
+### 安装流程（发布包实测）
+
+| 步骤 | 结果 |
+|---|---|
+| `install.sh --dry-run` | 正确预演全部步骤与 `disks.conf` 内容，宿主文件零写入（标记数仍为 0） |
+| 环境检查 | PVE 9.1.1 / python3 3.13.5 / smartctl 7.4 r5620 |
+| 磁盘检测 | 1 块：`/dev/sda 固态 119GB` |
+| 备份 | `/root/pve-nodeinfo-backup-<时间戳>/`（tar + sha256） |
+| 部署采集器 | `pve-hwinfo.sh`、`pve-nodeinfo-collect` 均 `0755 root:root` |
+| 生成设备清单 | `/etc/pve-nodeinfo/disks.conf`，1 条 `sd0=/dev/sda` |
+| 打补丁 | `Nodes.pm` 注入 3 字段（读缓存）；JS 插入 3 项；`height 350→434`、`minHeight 360→444` |
+| `perl -c` | syntax OK |
+| systemd 单元 | service + timer 均安装，timer `enabled` + `active`，`NEXT` 在 1 秒内触发 |
+| 缓存校验 | `sd0.json` **17902 字节**，型号与温度齐全 |
+| **权限校验** | `runuser -u www-data -- test -r /run/pve-nodeinfo/sd0.json` → **可读** |
+| API 验证 | `thermalstate` / `cpuFreq` / `sd0` 全部正常 |
+| `--check` | 8 项全部通过，退出码 0 |
+| 重复安装保护 | 二次执行被拒绝并提示先卸载 |
+| 服务日志 | 近 6 分钟无 error/fail/syntax |
+
+### 前端渲染回归
+
+`node --check` 检查补丁后 2.18MB 全文 → 通过。随后从补丁后的文件中切出**真实注入代码**，喂真实 API 数据与 10 种异常输入：
+
+```
+[thermal]  -> 主板: 28°C | CPU封装: 60°C | CPU0: 59°C | CPU1: 59°C | CPU2: 58°C | CPU3: 59°C
+[cpumhz]   -> 2.9 | 2.9 | 2.9 | 2.9 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORMANCE
+[disk0]    -> SATA SSD 119GB | 温度: 30°C | 通电: 1307时,次: 9 | SMART: 正常
+```
+
+边界场景（`undefined` / `null` / 空串 / 纯空格 / 垃圾串 / `{}` / 权限拒绝 / 休眠 / SMART 警告 / 设备不存在）：
+
+```
+undefined / null / 空串 / 纯空格 / 垃圾串  -> 未知
+{}                                        -> 未检测到该磁盘
+权限拒绝                                   -> 无法读取 SMART（权限不足）   ← 旧版误报场景
+休眠                                      -> 休眠中
+SMART 警告                                 -> WARN SSD | 温度: 45°C | SMART: 警告!
+设备不存在                                 -> 读取失败: ... No such device
+```
+
+**30 个组合全部返回非空字符串，零 throw。** 其中「权限拒绝」一条证明旧版的误报已被修正为准确描述。
+
+### 缓存缺失自愈（模拟重启）
+
+`/run` 是 tmpfs，重启后清空。手动删除缓存目录模拟该场景：
+
+| 时刻 | 观测 |
+|---|---|
+| 删除 `/run/pve-nodeinfo` 后立即查 API | `sd0 = ''`（前端渲染为「未知」，面板不报错、不白屏） |
+| 8 秒后 | 目录被 timer 自动重建，`sd0.json` 17902 字节，`0644 root:root`，`model_name` 正常 |
+
+说明缓存缺失是**优雅降级 + 自动恢复**，不需要人工干预。
+
+### 卸载回归
+
+| 检查项 | 结果 |
+|---|---|
+| timer 停用 | `Removed '/etc/systemd/system/timers.target.wants/...timer'` |
+| 单元移除 | service / timer 均删除，`daemon-reload` 已执行 |
+| 还原后 sha256 | 两个文件均 `OK`（与安装前逐字节一致） |
+| 标记残留 | 0 |
+| 采集器 / 配置 | `pve-hwinfo.sh`、`pve-nodeinfo-collect`、`/etc/pve-nodeinfo`、`/run/pve-nodeinfo` 全部删除 |
+| 面板高度 | 已复原 `height: 350` |
+| API 字段 | `thermalstate` 已消失 |
+| 服务 | pvedaemon / pveproxy 均 active |
+
+卸载后重新安装同样通过，可反复循环。**v1.0.0 → v1.1.0 的升级路径（先 uninstall 再 install）实测有效。**
+
+### 性能
+
+| 操作 | 实测 |
+|---|---|
+| `pve-nodeinfo-collect` 单次（1 块盘） | 0.03s |
+| 完整 `pvesh get /nodes/localhost/status` | 0.93s（含 pvesh 自身启动开销） |
+| 采集器调度 | `Nice=10`、`IOSchedulingClass=idle`，每 5 秒一次 |
+| load average（安装后） | 0.45 / 0.22 / 0.16 |
+
+相比 v1.0.0「每个浏览器标签页每次轮询 fork 一次 `smartctl`（约 18KB JSON）」，改为固定 5 秒一次，标签页数量不再放大开销。
+
+---
+
+## 九、未覆盖项
 
 | 项 | 原因 | 影响 |
 |---|---|---|
