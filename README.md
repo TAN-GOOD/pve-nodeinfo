@@ -19,11 +19,37 @@ CPU频率(GHz)  3.1 | 3.0 | 2.9 | 3.0 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORM
 
 ## 🚀 一句话安装
 
-SSH 登录 PVE 主机（或在 PVE 网页版的 Shell 里），粘贴这一行：
+SSH 登录 PVE 主机（或在 PVE 网页版的 Shell 里），**按你的网络情况选一条**粘贴即可。
+
+### 国内用户（无梯子 / 无代理）— 推荐
+
+```bash
+curl -fsSL https://gitee.com/T510/pve-nodeinfo/raw/main/install-online.sh | bash -s -- --cn
+```
+
+- 脚本和安装包**都从 Gitee 国内节点取**，不需要代理、不需要改 DNS，速度正常；
+- 万一 Gitee 上没有对应版本，会自动退回国内加速镜像，不会卡在半路；
+- 内容依然要过 SHA256 校验，镜像改不动包。
+
+> `bash -s -- --cn` 是把 `--cn` 参数传给脚本，含义是「走国内源」。
+
+### 国外 / 能直连 GitHub
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
 ```
+
+- 直连 GitHub 官方源，中间没有第三方环节；
+- 能打开 GitHub 但下载很慢时，改用 `| bash -s -- --mirror` 走加速镜像。
+
+### 两条命令怎么选
+
+| | 国内版（`--cn`） | 国外版 |
+|---|---|---|
+| 脚本来源 | Gitee | GitHub raw |
+| 安装包来源 | Gitee，失败自动退回国内镜像 | GitHub 官方 |
+| 需要梯子/代理 | **不需要** | 不需要（能访问 GitHub 即可） |
+| 典型场景 | 中国大陆家庭宽带、公司/学校网络、国内机房 | 海外 VPS、已配好代理的环境 |
 
 **全程不需要输入任何内容。** 脚本会自动完成：环境检查 → 依赖补齐（缺 `smartmontools` 会尝试自动安装）→ 网络测试 → 下载发布包 → SHA256 校验 → 安装 → 9 项结果验证。每一步都有中文进度和 ✔/✘ 标记。
 
@@ -40,15 +66,26 @@ CPU频率(GHz)  3.1 | 3.0 | 2.9 | 3.0 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORM
 
 ### 其他常用操作
 
-```bash
-# 只体检，不下载、不安装、不改任何文件
-curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --doctor
+先把脚本存到本地，之后反复用（国内用户用第一条，国外用户用第二条）：
 
-# 卸载（PVE 升级前务必执行；会把界面文件还原到安装前）
-curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --uninstall
+```bash
+# 国内用户
+curl -fsSL https://gitee.com/T510/pve-nodeinfo/raw/main/install-online.sh -o /tmp/pni.sh
+
+# 国外用户
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh
 ```
 
-预演、强制重装、指定版本、离线安装、加速镜像等**全部参数见[第四节](#四安装)**。
+然后按需执行（**国内用户请给联网的命令加 `--cn`**）：
+
+```bash
+bash /tmp/pni.sh --doctor --cn      # 只体检，不下载、不安装、不改任何文件
+bash /tmp/pni.sh --dry-run --cn     # 预演安装流程，不写任何文件
+bash /tmp/pni.sh --force --cn       # 强制重装（先卸载再装）
+bash /tmp/pni.sh --uninstall        # 卸载（PVE 升级前务必执行，不需要联网）
+```
+
+指定版本、离线安装、加速镜像等**全部参数见[第四节](#四安装)**。
 
 ---
 

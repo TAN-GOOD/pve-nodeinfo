@@ -4,7 +4,10 @@
 #  在 Proxmox VE 节点的「摘要」面板中增加  温度 / CPU 频率 / 功耗 / 磁盘健康
 #
 #  一句话运行（在 PVE 主机上，root 身份）：
-#    curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+#    国外 / 能直连 GitHub：
+#      curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+#    国内 / 无法访问 GitHub：
+#      curl -fsSL https://gitee.com/T510/pve-nodeinfo/raw/main/install-online.sh | bash -s -- --cn
 #
 #  更多用法：
 #    bash install-online.sh --doctor      只体检，不改任何东西
@@ -24,8 +27,12 @@
 set -uo pipefail
 
 REPO="TAN-GOOD/pve-nodeinfo"
+GITEE_REPO="T510/pve-nodeinfo"
 DEFAULT_VERSION="1.2.0"
 SCRIPT_DATE="2026-11-26"
+
+# 下载源。github = 官方，gitee = 国内镜像（--cn）
+SOURCE="github"
 
 # 已知版本的 SHA256。正常流程用 GitHub API 返回的 digest 校验，
 # 这里只是 API 不可用（限流 / 离线）时的兜底。
@@ -66,8 +73,10 @@ pve-nodeinfo 一键安装脚本
   --dry-run         预演安装流程，打印将要做什么，不写入任何文件
   --force           即使已装同版本也强制重装（内部先卸载再安装）
   --uninstall       卸载，并把 PVE 界面文件还原到安装前
-  --version <版本>  指定安装版本，例如 1.2.0（默认装 GitHub 上的最新版）
+  --version <版本>  指定安装版本，例如 1.2.0（默认装所选源上的最新版）
   --pkg <路径|URL>  使用自定义发布包，跳过在线下载
+  --cn              国内源模式：从 Gitee 镜像下载发布包（无需代理）
+  --source <源>     显式指定下载源：github（默认）或 gitee（等同 --cn）
   --mirror          主站下载失败时，额外尝试第三方 GitHub 加速镜像
                     （内容仍需通过 SHA256 校验，镜像无法篡改内容）
   --keep            保留下载的临时文件，便于排查问题
@@ -75,6 +84,9 @@ pve-nodeinfo 一键安装脚本
   -h, --help        显示本帮助
 
 常用示例:
+  # 国内网络（无法访问 GitHub）
+  bash install-online.sh --cn
+
   # 先体检，什么都不改
   bash install-online.sh --doctor
 
@@ -102,11 +114,19 @@ while [ $# -gt 0 ]; do
         --version=*)      WANT_VERSION="${1#*=}" ;;
         --pkg)            PKG_SRC="${2:-}"; shift ;;
         --pkg=*)          PKG_SRC="${1#*=}" ;;
+        --cn)             SOURCE="gitee" ;;
+        --source)         SOURCE="${2:-github}"; shift ;;
+        --source=*)       SOURCE="${1#*=}" ;;
         -h|--help)        usage; exit 0 ;;
         *)                printf '未知参数: %s\n（用 --help 查看支持的参数）\n' "$1" >&2; exit 1 ;;
     esac
     shift
 done
+
+case "$SOURCE" in
+    github|gitee) ;;
+    *) printf '不支持的下载源: %s（只能是 github 或 gitee）\n' "$SOURCE" >&2; exit 1 ;;
+esac
 
 # ------------------------------------------------------------------ 输出层 --
 if [ "$USE_COLOR" = "1" ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -202,6 +222,26 @@ api_json() {
     fi
 }
 
+# Gitee 的 Release 附件地址是可预测的，只需要拿到最新 tag
+gitee_latest_tag() {
+    if have curl; then
+        curl -fsSL --connect-timeout 10 --max-time 25 \
+             "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/latest" 2>/dev/null
+    else
+        wget -q -T 20 -O - \
+             "https://gitee.com/api/v5/repos/$GITEE_REPO/releases/latest" 2>/dev/null
+    fi | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+t = (d.get("tag_name") or "").lstrip("v")
+if t:
+    print(t)
+' 2>/dev/null
+}
+
 download() {  # $1=url  $2=目标文件
     if have curl; then
         curl -fL -sS --connect-timeout 10 --max-time 300 \
@@ -227,6 +267,9 @@ latest_backup() {
 # =============================================================== 开场 =====
 head1 "pve-nodeinfo 一键安装"
 printf '  %s目标：在 PVE 节点摘要面板增加 温度 / CPU频率 / 功耗 / 磁盘健康%s\n' "$C_D" "$C_RST"
+if [ "$SOURCE" = "gitee" ]; then
+    printf '  %s下载源：Gitee 国内镜像%s\n' "$C_D" "$C_RST"
+fi
 printf '  %s日志：%s%s\n' "$C_D" "$LOG" "$C_RST"
 
 need_root
@@ -462,8 +505,15 @@ fi
 if [ "$OFFLINE_PKG" = "1" ]; then
     info "使用本地包，跳过网络检查"
 else
+    if [ "$SOURCE" = "gitee" ]; then
+        info "下载源：Gitee（国内镜像）"
+        NET_ENDPOINTS="https://gitee.com https://gitee.com/api/v5"
+    else
+        NET_ENDPOINTS="https://api.github.com https://github.com https://objects.githubusercontent.com"
+    fi
+
     NET_OK=0
-    for u in https://api.github.com https://github.com https://objects.githubusercontent.com; do
+    for u in $NET_ENDPOINTS; do
         if http_ok "$u"; then
             ok "可访问 $u"
             NET_OK=1
@@ -474,8 +524,9 @@ else
     done
 
     if [ "$NET_OK" = "0" ]; then
-        fail "主机无法访问 GitHub，下载不了发布包" \
-"本插件需要从 GitHub 下载安装包（约 38 KB）。按顺序排查：
+        if [ "$SOURCE" = "gitee" ]; then
+            fail "主机无法访问 Gitee，下载不了发布包" \
+"已经用的是国内源了，还是不通，按顺序排查：
 
 1) 先确认主机能不能上网：
      ping -c 2 223.5.5.5
@@ -483,12 +534,39 @@ else
    ping 通但域名解析不了 = DNS 问题：
      echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 
-2) 如果主机走代理上网（例如 iStoreOS / Clash），给本次安装临时指定代理：
+2) 检查是不是 DNS 被污染：
+     nslookup gitee.com
+   如果解析到 127.0.0.1 或奇怪地址，换 DNS 再试。
+
+3) 如果主机走代理但代理不通，先关掉代理再试：
+     unset https_proxy http_proxy
+
+4) 实在不行改用离线安装：
+   - 在能上网的电脑下载
+       https://gitee.com/$GITEE_REPO/releases/latest
+     里的 pve-nodeinfo-*.tar.gz
+   - 上传到 PVE（scp 或 Web 界面上传）
+   - 执行
+       bash install-online.sh --pkg /path/to/pve-nodeinfo-1.2.0.tar.gz" 3
+        fi
+        fail "主机无法访问 GitHub，下载不了发布包" \
+"本插件默认从 GitHub 下载安装包（约 38 KB）。按顺序排查：
+
+1) **先试国内源**（不用代理、不用梯子）：
+     curl -fsSL https://gitee.com/$GITEE_REPO/raw/main/install-online.sh | bash -s -- --cn
+
+2) 确认主机能不能上网：
+     ping -c 2 223.5.5.5
+     cat /etc/resolv.conf
+   ping 通但域名解析不了 = DNS 问题：
+     echo 'nameserver 223.5.5.5' > /etc/resolv.conf
+
+3) 如果主机走代理上网（例如 iStoreOS / Clash），给本次安装临时指定代理：
      export https_proxy=http://<代理IP>:<端口>
      export http_proxy=http://<代理IP>:<端口>
    然后重新执行本脚本。
 
-3) 实在不行就用离线安装：
+4) 实在不行就用离线安装：
    - 在能上网的电脑下载
        https://github.com/$REPO/releases/latest
      里的 pve-nodeinfo-*.tar.gz
@@ -526,6 +604,16 @@ elif [ -n "$PKG_SRC" ]; then
     TARGET_VER=$(basename "$PKG_SRC" | sed -n 's/^pve-nodeinfo-\([0-9][0-9.]*\)\.tar\.gz$/\1/p')
     [ -z "$TARGET_VER" ] && TARGET_VER="$DEFAULT_VERSION"
     ok "从包文件名识别出版本 $TARGET_VER"
+elif [ "$SOURCE" = "gitee" ]; then
+    info "查询 Gitee 最新版本 ..."
+    GTAG=$(gitee_latest_tag)
+    if [ -n "$GTAG" ]; then
+        TARGET_VER="$GTAG"
+        ok "Gitee 最新版本：$TARGET_VER"
+    else
+        warn "无法从 Gitee 读取版本信息，回退到内置版本"
+        TARGET_VER="$DEFAULT_VERSION"
+    fi
 else
     info "查询 GitHub 最新版本 ..."
     PARSED=$(api_json 2>/dev/null | python3 -c '
@@ -653,11 +741,20 @@ if [ ! -s "$PKGFILE" ]; then
         PKG_URL="$PKG_SRC"
     fi
     if [ -z "$PKG_URL" ]; then
-        PKG_URL="https://github.com/$REPO/releases/download/v$TARGET_VER/pve-nodeinfo-$TARGET_VER.tar.gz"
+        if [ "$SOURCE" = "gitee" ]; then
+            PKG_URL="https://gitee.com/$GITEE_REPO/releases/download/v$TARGET_VER/pve-nodeinfo-$TARGET_VER.tar.gz"
+        else
+            PKG_URL="https://github.com/$REPO/releases/download/v$TARGET_VER/pve-nodeinfo-$TARGET_VER.tar.gz"
+        fi
     fi
 
     URLS=("$PKG_URL")
-    if [ "$MIRROR" = "1" ]; then
+    if [ "$SOURCE" = "gitee" ]; then
+        # Gitee 上没有该版本时自动退回国内加速镜像，避免国内用户卡在半路
+        GH_URL="https://github.com/$REPO/releases/download/v$TARGET_VER/pve-nodeinfo-$TARGET_VER.tar.gz"
+        URLS+=("https://ghfast.top/$GH_URL" "https://gh-proxy.com/$GH_URL")
+        info "Gitee 下载失败时会自动尝试国内加速镜像（同样要过 SHA256 校验）"
+    elif [ "$MIRROR" = "1" ]; then
         URLS+=("https://ghfast.top/$PKG_URL" "https://gh-proxy.com/$PKG_URL" "https://ghproxy.net/$PKG_URL")
         info "已启用加速镜像（内容仍需通过 SHA256 校验，镜像无法篡改）"
     fi
@@ -682,6 +779,10 @@ if [ ! -s "$PKGFILE" ]; then
 ${LAST_ERR:-（无）}
 
 常见原因与对策：
+
+· 403 / 404 / 一直超时 —— 国内网络访问 GitHub 受限
+    改用 Gitee 国内源，不用代理也不用梯子：
+      curl -fsSL https://gitee.com/$GITEE_REPO/raw/main/install-online.sh | bash -s -- --cn
 
 · Could not resolve host —— DNS 解析失败
     echo 'nameserver 223.5.5.5' > /etc/resolv.conf
