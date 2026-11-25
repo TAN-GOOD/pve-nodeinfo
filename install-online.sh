@@ -152,8 +152,9 @@ if [ "$(id -u)" -eq 0 ] && [ -d /var/log ] && [ -w /var/log ]; then
 else
     LOG="${TMPDIR:-/tmp}/pve-nodeinfo-install-$TS.log"
 fi
-# 屏幕输出同时落盘；进程替换不可用时静默降级，不阻断安装
-exec > >(tee -a "$LOG") 2>&1 || LOG="(未记录)"
+# 屏幕输出同时落盘。tee 属 coreutils 基本组件，正常情况下一定存在；
+# 若进程替换在本环境不支持，bash 会在 exec 处报错并退出，不会被静默吞掉。
+exec > >(tee -a "$LOG") 2>&1
 
 TMPD=""
 cleanup() {
