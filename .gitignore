@@ -1,0 +1,24 @@
+# 系统文件备份（安装器写入 /root 下，不在仓库内）
+*.bak
+*.patchtmp
+*.pve-nodeinfo.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地打包产物
+dist/
+*.tar.gz
+*.zip
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 本地测试数据
+status.json
+items.js
+patched_*.js
