@@ -17,6 +17,41 @@ CPU频率(GHz)  3.1 | 3.0 | 2.9 | 3.0 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORM
 
 ---
 
+## 🚀 一句话安装
+
+SSH 登录 PVE 主机（或在 PVE 网页版的 Shell 里），粘贴这一行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+```
+
+**全程不需要输入任何内容。** 脚本会自动完成：环境检查 → 依赖补齐（缺 `smartmontools` 会尝试自动安装）→ 网络测试 → 下载发布包 → SHA256 校验 → 安装 → 9 项结果验证。每一步都有中文进度和 ✔/✘ 标记。
+
+安装过程中任何一步失败，都会在**卸载旧版本之前**停下并打印「原因 / 原始错误 / 怎么解决」，所以**不会把你现在能用的版本弄坏**。重复运行也是安全的：同版本直接跳过，不同版本先卸载再装。
+
+装完在浏览器打开 `https://<你的PVE地址>:8006`，按 **`Shift + F5`** 强制刷新，节点「摘要」面板就会多出这 4 行：
+
+```
+温度(°C)      Board: 28°C | CPU封装: 55°C | CPU0: 56°C | CPU1: 58°C | ...
+CPU频率(GHz)  3.1 | 3.0 | 2.9 | 3.0 | MAX: 3.4 | MIN: 0.7 | 调速器: PERFORMANCE
+功耗(W)       3.9 W
+固态硬盘0      CT500MX500SSD1 | 温度: 30°C | 通电: 1306时,次: 9 | SMART: 正常
+```
+
+### 其他常用操作
+
+```bash
+# 只体检，不下载、不安装、不改任何文件
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --doctor
+
+# 卸载（PVE 升级前务必执行；会把界面文件还原到安装前）
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --uninstall
+```
+
+预演、强制重装、指定版本、离线安装、加速镜像等**全部参数见[第四节](#四安装)**。
+
+---
+
 ## 一、版本概述
 
 ### v1.2.0：新增功耗显示
@@ -93,21 +128,7 @@ v1.1.0 改为 **root 预采集 + 面板只读缓存文件**：由一个 systemd 
 
 ### 方式 A：一句话安装（推荐）
 
-SSH 登录 PVE 主机（`ssh root@<PVE的IP>`，或在 PVE 的 Shell 里），粘贴执行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
-```
-
-它会自动完成：环境检查 → 依赖补齐（缺 `smartmontools` 会尝试自动安装）→ 网络连通性测试 → 下载发布包 → SHA256 校验 → 安装 → 9 项结果验证。
-
-全程**不需要输入任何内容**，任何一步失败都会打印「原因 / 原始错误 / 怎么解决」，并且**在卸载旧版本之前就停下**，不会把你现在能用的版本弄坏。重复运行是安全的：同版本直接跳过，不同版本先卸载再装。
-
-先体检、什么都不改：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --doctor
-```
+命令见本文开头的「🚀 一句话安装」。下面是它的全部可选参数：
 
 | 场景 | 参数 |
 |---|---|
