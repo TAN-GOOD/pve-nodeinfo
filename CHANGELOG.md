@@ -2,6 +2,26 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **`install-online.sh` 一键安装脚本**（仓库根，不随发布包分发）。面向不想折腾的使用者，
+  一条命令完成「环境检查 → 依赖补齐 → 网络测试 → 下载 → 校验 → 安装 → 验证」：
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+  ```
+
+  - 全流程非交互，可直接粘贴运行；
+  - 缺 `smartmontools` 时自动尝试 `apt install`（失败仅降级为「磁盘行显示未知」，不中断）；
+  - 校验值优先取 GitHub API 的 `digest` 字段，API 不可用时回退到脚本内置的 SHA256 表；
+  - 失败退出码分类：`2` 环境不符 / `3` 网络不通 / `4` 包损坏 / `5` 安装失败，便于脚本化判断；
+  - 幂等：同版本直接跳过并只做健康检查，不同版本先卸载再装；**下载与校验都在卸载之前完成**，
+    中途失败不会破坏现有可用版本；
+  - `--doctor` / `--dry-run` / `--force` / `--uninstall` / `--version` / `--pkg` / `--mirror` 七个开关；
+  - `--uninstall` 逻辑内联在脚本里，不依赖网络，即使发版页挂了也能卸载。
+
 ## [1.2.0] - 2026-11-26
 
 ### 新增

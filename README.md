@@ -89,6 +89,48 @@ v1.1.0 改为 **root 预采集 + 面板只读缓存文件**：由一个 systemd 
 
 ## 四、安装
 
+两种方式效果完全相同。**只想快点用上就选方式 A。**
+
+### 方式 A：一句话安装（推荐）
+
+SSH 登录 PVE 主机（`ssh root@<PVE的IP>`，或在 PVE 的 Shell 里），粘贴执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+```
+
+它会自动完成：环境检查 → 依赖补齐（缺 `smartmontools` 会尝试自动安装）→ 网络连通性测试 → 下载发布包 → SHA256 校验 → 安装 → 9 项结果验证。
+
+全程**不需要输入任何内容**，任何一步失败都会打印「原因 / 原始错误 / 怎么解决」，并且**在卸载旧版本之前就停下**，不会把你现在能用的版本弄坏。重复运行是安全的：同版本直接跳过，不同版本先卸载再装。
+
+先体检、什么都不改：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh -o /tmp/pni.sh && bash /tmp/pni.sh --doctor
+```
+
+| 场景 | 参数 |
+|---|---|
+| 只体检，不改动 | `--doctor` |
+| 预演，不写任何文件 | `--dry-run` |
+| 强制重装 | `--force` |
+| 卸载（**升级 PVE 前必做**） | `--uninstall` |
+| 指定版本 | `--version 1.2.0` |
+| 离线安装（用已下载的包） | `--pkg /tmp/pve-nodeinfo-1.2.0.tar.gz` |
+| 直连 GitHub 很慢 | `--mirror` |
+
+> `--mirror` 会额外尝试 `ghfast.top` 等第三方加速镜像。**所有来源都必须通过 SHA256 校验**，镜像无法篡改内容 —— 校验值取自 GitHub API 的 `digest` 字段，API 不可用时回退到脚本内置表。
+
+主机出网需要代理时：
+
+```bash
+export https_proxy=http://<代理IP>:<端口>
+export http_proxy=http://<代理IP>:<端口>
+curl -fsSL https://raw.githubusercontent.com/TAN-GOOD/pve-nodeinfo/main/install-online.sh | bash
+```
+
+### 方式 B：手动下载安装
+
 ```bash
 tar xzf pve-nodeinfo-1.2.0.tar.gz
 cd pve-nodeinfo-1.2.0
