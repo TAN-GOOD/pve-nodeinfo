@@ -1,14 +1,19 @@
 #!/bin/bash
-# pve-nodeinfo 磁盘 SMART 采集器
+# pve-nodeinfo 硬件数据采集器（磁盘 SMART + CPU 封装功耗）
 #
-# 由 pve-nodeinfo-collect.timer 以 root 身份每 5 秒调用一次，把每块盘的
-# `smartctl -a -j` 输出写入 /run/pve-nodeinfo/<字段名>.json（权限 0644）。
+# 由 pve-nodeinfo-collect.timer 以 root 身份每 5 秒调用一次，把结果写入
+# /run/pve-nodeinfo/（权限 0644），供面板侧以 www-data 身份只读。
 #
 # 为什么需要它：
-#   PVE 处理 Web/API 请求的进程会被降权成 www-data，而 /dev/sdX 是 root:disk
-#   且权限 660，www-data 读不到设备，smartctl 只能返回 "Permission denied"。
-#   改由 root 预采集、面板侧只读普通文件，就不必给 www-data 任何额外权限
-#   （不加 sudo、不加 disk 组、不设 SUID）。
+#   PVE 处理 Web/API 请求的进程会被降权成 www-data，而
+#     /dev/sdX                      是 root:disk 660
+#     /sys/class/powercap/*/energy_uj  是 root root 400
+#   www-data 两者都读不到。改由 root 预采集、面板侧只读普通文件，
+#   就不必给 www-data 任何额外权限（不加 sudo、不加 disk 组、不设 SUID）。
+#
+# 输出：
+#   /run/pve-nodeinfo/sdN.json     每块盘的 smartctl -a -j 原始输出
+#   /run/pve-nodeinfo/power.json   CPU 封装功耗
 #
 # 设备清单来自 /etc/pve-nodeinfo/disks.conf，由安装时自动扫描生成：
 #   sd0=/dev/sda
@@ -16,43 +21,164 @@
 
 set -u
 
-CONF=/etc/pve-nodeinfo/disks.conf
-OUT=/run/pve-nodeinfo
-SMARTCTL=/usr/sbin/smartctl
+# 路径可用环境变量覆盖，仅用于离线测试（systemd 运行时不会设置这些变量）
+CONF="${NODEINFO_CONF:-/etc/pve-nodeinfo/disks.conf}"
+OUT="${NODEINFO_RUN:-/run/pve-nodeinfo}"
+SMARTCTL="${NODEINFO_SMARTCTL:-/usr/sbin/smartctl}"
+POWERCAP="${NODEINFO_POWERCAP:-/sys/class/powercap}"
+POWER_STATE="$OUT/.power.state"
 
 install -d -m 0755 "$OUT" || exit 1
-[ -r "$CONF" ] || exit 0
-[ -x "$SMARTCTL" ] || exit 0
 
-while IFS='=' read -r key dev; do
-    case "$key" in
-        ''|\#*) continue ;;
-    esac
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    dev="$(printf '%s' "$dev" | tr -d '[:space:]')"
-    [ -n "$key" ] && [ -n "$dev" ] || continue
 
-    target="$OUT/$key.json"
+# ---------------------------------------------------------------- 功耗
+# RAPL 的 energy_uj 是「自开机以来的累计微焦」，不是功率。要得到瓦特必须
+# 两次采样差分；而本进程每 5 秒被 systemd 重新拉起，没有内存状态，所以把
+# 上次的累计值和单调时间戳存到 $POWER_STATE（在 tmpfs 上，重启自动清空，
+# 与 RAPL 计数器归零的时机天然一致，不会算出跨重启的假功率）。
 
-    # 设备真的不在了：明确写 {}，前端显示「未检测到该磁盘」
-    if [ ! -b "$dev" ]; then
-        printf '{}' >"$target"
-        chmod 0644 "$target"
-        continue
+write_power_fail() {
+    local tmp="$OUT/.power.json.$$"
+    printf '{"ok":false,"reason":"%s"}' "$1" >"$tmp" \
+        && chmod 0644 "$tmp" \
+        && mv -f "$tmp" "$OUT/power.json"
+}
+
+collect_power() {
+    local d b n pkg_path='' psys_path='' max_r
+
+    for d in "$POWERCAP"/*; do
+        [ -d "$d" ] || continue
+        b=${d##*/}
+        # 跳过 intel-rapl:0:0 这类子域（core / uncore / dram），只取顶层域
+        case "$b" in *:*:*) continue ;; esac
+        n=$(cat "$d/name" 2>/dev/null) || continue
+        case "$n" in
+            package-0) pkg_path="$d" ;;
+            psys)      psys_path="$d" ;;
+        esac
+    done
+
+    # 没有 package 域：AMD 的 amd_energy 走 hwmon，路径不同，本版本不支持
+    if [ -z "$pkg_path" ]; then
+        write_power_fail unsupported
+        return
     fi
 
-    tmp="$OUT/.$key.json.$$"
-    # smartctl 对部分 USB/RAID 卡会返回非 0，但仍输出有效 JSON，故忽略退出码
-    "$SMARTCTL" "$dev" -a -j >"$tmp" 2>/dev/null || true
+    local pkg_now psys_now now_ns
+    pkg_now=$(cat "$pkg_path/energy_uj" 2>/dev/null) || { write_power_fail unreadable; return; }
+    case "$pkg_now" in ''|*[!0-9]*) write_power_fail unreadable; return ;; esac
 
-    if [ -s "$tmp" ]; then
-        chmod 0644 "$tmp"
-        mv -f "$tmp" "$target"
+    max_r=$(cat "$pkg_path/max_energy_range_uj" 2>/dev/null) || max_r=0
+    case "$max_r" in ''|*[!0-9]*) max_r=0 ;; esac
+
+    psys_now=$(cat "$psys_path/energy_uj" 2>/dev/null) || true
+    case "$psys_now" in ''|*[!0-9]*) psys_now='' ;; esac
+
+    now_ns=$(date +%s%N)
+
+    local last_pkg='' last_psys='' last_ts=''
+    if [ -r "$POWER_STATE" ]; then
+        read -r last_pkg last_psys last_ts <"$POWER_STATE" || true
+    fi
+
+    # 无论本次能否算出功率，都刷新状态，避免窗口无限增长
+    printf '%s %s %s\n' "$pkg_now" "${psys_now:--}" "$now_ns" >"$POWER_STATE"
+
+    local pkg_w='' psys_w=''
+    if [ -n "$last_pkg" ] && [ -n "$last_ts" ]; then
+        # d<0 说明计数器回绕，加上 max_energy_range_uj 修正
+        # dt>60 说明中途停采过（手动 disable、休眠等），本次丢弃
+        pkg_w=$(awk -v c="$pkg_now" -v p="$last_pkg" -v t="$now_ns" -v o="$last_ts" -v m="$max_r" 'BEGIN {
+            d = c - p;
+            if (d < 0 && m > 0) d += m;
+            dt = (t - o) / 1000000000;
+            if (d < 0 || dt <= 0 || dt > 60) { exit }
+            w = d / dt / 1000000;
+            if (w < 0 || w > 2000) { exit }
+            printf "%.2f", w;
+        }')
+    fi
+
+    if [ -n "$pkg_w" ] && [ -n "$psys_now" ] && [ -n "$last_psys" ] && [ "$last_psys" != "-" ]; then
+        psys_w=$(awk -v c="$psys_now" -v p="$last_psys" -v t="$now_ns" -v o="$last_ts" -v m="$max_r" 'BEGIN {
+            d = c - p;
+            if (d < 0 && m > 0) d += m;
+            dt = (t - o) / 1000000000;
+            if (d < 0 || dt <= 0 || dt > 60) { exit }
+            w = d / dt / 1000000;
+            if (w < 0 || w > 2000) { exit }
+            printf "%.2f", w;
+        }')
+    fi
+
+    # psys 是平台域，物理上必然不小于 CPU 封装。实测部分 N100 主板没有把
+    # VR 电流信号接出来，psys 只报 0.3W 这种退化值，必须挡掉否则面板会
+    # 显示一个比封装功耗还小的「整机功耗」。
+    if [ -n "$psys_w" ] && [ -n "$pkg_w" ]; then
+        psys_w=$(awk -v s="$psys_w" -v p="$pkg_w" 'BEGIN {
+            if (s + 0 >= p * 0.85 && s + 0 < 2000) printf "%.2f", s;
+        }')
+    fi
+
+    if [ -z "$pkg_w" ]; then
+        write_power_fail warmup
+        return
+    fi
+
+    local tmp="$OUT/.power.json.$$"
+    if [ -n "$psys_w" ]; then
+        printf '{"ok":true,"pkg_w":%s,"psys_w":%s,"ts":%s}\n' \
+            "$pkg_w" "$psys_w" "$(date +%s)" >"$tmp"
     else
-        # 采集失败但设备仍在：保留上一次的有效数据，避免面板在
-        # 「正常」与「未检测到」之间来回跳变
-        rm -f "$tmp"
+        printf '{"ok":true,"pkg_w":%s,"psys_w":null,"ts":%s}\n' \
+            "$pkg_w" "$(date +%s)" >"$tmp"
     fi
-done <"$CONF"
+    chmod 0644 "$tmp" && mv -f "$tmp" "$OUT/power.json"
+}
+
+
+# ---------------------------------------------------------------- 磁盘
+collect_disks() {
+    [ -r "$CONF" ] || return 0
+    [ -x "$SMARTCTL" ] || return 0
+
+    local key dev target tmp
+    while IFS='=' read -r key dev; do
+        case "$key" in
+            ''|\#*) continue ;;
+        esac
+        key="$(printf '%s' "$key" | tr -d '[:space:]')"
+        dev="$(printf '%s' "$dev" | tr -d '[:space:]')"
+        [ -n "$key" ] && [ -n "$dev" ] || continue
+
+        target="$OUT/$key.json"
+
+        # 设备真的不在了：明确写 {}，前端显示「未检测到该磁盘」
+        if [ ! -b "$dev" ]; then
+            printf '{}' >"$target"
+            chmod 0644 "$target"
+            continue
+        fi
+
+        tmp="$OUT/.$key.json.$$"
+        # smartctl 对部分 USB/RAID 卡会返回非 0，但仍输出有效 JSON，故忽略退出码
+        "$SMARTCTL" "$dev" -a -j >"$tmp" 2>/dev/null || true
+
+        if [ -s "$tmp" ]; then
+            chmod 0644 "$tmp"
+            mv -f "$tmp" "$target"
+        else
+            # 采集失败但设备仍在：保留上一次的有效数据，避免面板在
+            # 「正常」与「未检测到」之间来回跳变
+            rm -f "$tmp"
+        fi
+    done <"$CONF"
+}
+
+
+# 两段互不影响：没装 smartctl 或没有 disks.conf 时，功耗照常采集
+collect_power
+collect_disks
 
 exit 0

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""在 PVE 节点状态面板中增加 温度 / CPU 频率 / 磁盘信息 显示。
+"""在 PVE 节点状态面板中增加 温度 / CPU 频率 / 功耗 / 磁盘信息 显示。
 
 本脚本做三件事，全部带锚点断言，锚点不符立即退出、不改任何文件：
   1) 生成 /etc/pve-nodeinfo/disks.conf（root 采集器与面板字段的对应关系）
-  2) 向 Nodes.pm 注入 2+N 个只读字段（N = 自动检测到的磁盘数）
+  2) 向 Nodes.pm 注入 3+N 个只读字段（N = 自动检测到的磁盘数）
   3) 向 pvemanagerlib.js 的 pveNodeStatus items 数组注入显示项，并调整面板高度
 
 不做的事（与原版社区脚本的重要区别）：
@@ -33,6 +33,7 @@ SMARTCTL = "/usr/sbin/smartctl"
 CONF_DIR = "/etc/pve-nodeinfo"
 DISKS_CONF = "/etc/pve-nodeinfo/disks.conf"
 RUNDIR = "/run/pve-nodeinfo"
+POWER_JSON = "/run/pve-nodeinfo/power.json"
 UNIT_DIR = "/etc/systemd/system"
 
 MARK = "pve-nodeinfo"
@@ -104,6 +105,26 @@ def detect_disks():
     return disks
 
 
+def detect_power():
+    """查找 Intel RAPL 的 package-0 顶层域；返回路径或 None。
+
+    只认顶层域，跳过 intel-rapl:0:0 这类子域（core/uncore/dram）。
+    AMD 的 amd_energy 走 hwmon，路径不同，本版本不支持。
+    """
+    base = "/sys/class/powercap"
+    if not os.path.isdir(base):
+        return None
+    for name in sorted(os.listdir(base)):
+        if name.count(":") > 1:
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path):
+            continue
+        if read_sys(os.path.join(path, "name")) == "package-0":
+            return path
+    return None
+
+
 def conf_text(disks):
     lines = [
         "# pve-nodeinfo 磁盘清单（由 install.sh 自动生成，勿手工编辑）",
@@ -138,11 +159,22 @@ PERL_DISK_BLOCK = """        # SMART 数据由 pve-nodeinfo-collect.timer 以 ro
 """
 
 
+PERL_POWER_BLOCK = """        # 功耗同理：energy_uj 是 root-only(400)，www-data 读不到
+        $res->{powerState} = do {
+            my $f = '%(run)s/power.json';
+            my $c = '';
+            if (open(my $fh, '<', $f)) { local $/; $c = <$fh>; close($fh); }
+            $c // '';
+        };
+"""
+
+
 def build_perl_block(disks):
     lines = ["", "        #" + MARK]
     lines.append('        $res->{thermalstate} = `%s thermal 2>/dev/null`;' % HELPER)
     lines.append('        $res->{cpuFreq} = `%s cpu 2>/dev/null`;' % HELPER)
     out = "\n".join(lines) + "\n"
+    out += PERL_POWER_BLOCK % {"run": RUNDIR}
     for idx in range(len(disks)):
         out += PERL_DISK_BLOCK % {"idx": idx, "run": RUNDIR}
     return out
@@ -235,6 +267,55 @@ JS_THERMAL = """
         },
 """ % {"mark": MARK}
 
+JS_POWER = """
+        {
+            itemId: 'nodepower',
+            colspan: 2,
+            printBar: false,
+            title: gettext('功耗(W)'),
+            textField: 'powerState',
+            value: '',
+            renderer: function (value) {
+                try {
+                    if (value === undefined || value === null || !String(value).trim()) {
+                        return Proxmox.Utils.unknownText;
+                    }
+                    let v = typeof value === 'string' ? JSON.parse(value) : value;
+                    if (!v) {
+                        return Proxmox.Utils.unknownText;
+                    }
+                    if (v.ok !== true) {
+                        if (v.reason === 'warmup') {
+                            return '采集中...';
+                        }
+                        if (v.reason === 'unsupported') {
+                            return '本机不支持功耗读取';
+                        }
+                        return Proxmox.Utils.unknownText;
+                    }
+                    // Number(null) 和 Number('') 都是 0，必须先挡掉再转换，
+                    // 否则「没有数值」会被显示成 0.0 W
+                    if (v.pkg_w === null || v.pkg_w === undefined
+                        || String(v.pkg_w).trim() === '') {
+                        return Proxmox.Utils.unknownText;
+                    }
+                    let w = Number(v.pkg_w);
+                    if (!isFinite(w) || w < 0) {
+                        return Proxmox.Utils.unknownText;
+                    }
+                    let text = w.toFixed(1) + ' W';
+                    let p = Number(v.psys_w);
+                    if (v.psys_w !== null && v.psys_w !== undefined && isFinite(p) && p > 0) {
+                        text += ' | 整机: ' + p.toFixed(1) + ' W';
+                    }
+                    return text;
+                } catch (e) {
+                    return Proxmox.Utils.unknownText;
+                }
+            },
+        },
+"""
+
 JS_DISK = """
         {
             itemId: 'disk%(idx)d',
@@ -298,7 +379,7 @@ JS_DISK = """
 
 
 def build_js_block(disks):
-    out = JS_THERMAL
+    out = JS_THERMAL + JS_POWER
     for idx, disk in enumerate(disks):
         out += JS_DISK % {"idx": idx, "title": disk_title(disk, idx)}
     return out
@@ -322,12 +403,12 @@ def patch_nodes_pm(text, disks, dry):
 
     block = build_perl_block(disks)
     if dry:
-        return text, "将注入 %d 个字段（温度/频率 + %d 个磁盘，读缓存文件）" % (
-            2 + len(disks),
+        return text, "将注入 %d 个字段（温度/频率/功耗 + %d 个磁盘，读缓存文件）" % (
+            3 + len(disks),
             len(disks),
         )
     return text.replace(NODES_ANCHOR, NODES_ANCHOR + block, 1), "注入 %d 个采集字段" % (
-        2 + len(disks)
+        3 + len(disks)
     )
 
 
@@ -353,7 +434,7 @@ def patch_manager_js(text, disks, dry):
     if lines[close + 1].strip() != "],":
         return None, "items 数组结构与预期不符: %r" % lines[close + 1]
 
-    items = 2 + len(disks)
+    items = 3 + len(disks)
     add_height = LINE_HEIGHT * items
 
     # 高度调整的目标行需要在插入前定位，插入会把行号推后
@@ -458,6 +539,20 @@ def do_check():
         print("缓存目录: 缺失 (%s)" % RUNDIR)
         ok = False
 
+    # 功耗缓存：缺失/不支持/预热中都不算安装失败（属环境差异），仅报告
+    if not os.path.exists(POWER_JSON):
+        print("功耗缓存: 缺失 (%s)" % POWER_JSON)
+    else:
+        body = read_text(POWER_JSON).strip()
+        if '"ok":true' in body:
+            print("功耗缓存: 正常 (%s)" % body[:90])
+        elif "warmup" in body:
+            print("功耗缓存: 预热中（等下一次采集即为有效值）")
+        elif "unsupported" in body:
+            print("功耗缓存: 本机无 RAPL package 域，面板显示「本机不支持功耗读取」")
+        else:
+            print("功耗缓存: 异常 (%s)" % (body[:90] or "空文件"))
+
     return 0 if ok else 1
 
 
@@ -496,6 +591,14 @@ def main():
         print("  未检测到磁盘，仅显示温度与频率")
     elif not os.path.exists(SMARTCTL):
         print("  警告: 未找到 %s，磁盘信息将显示为「未知」" % SMARTCTL)
+
+    pkg = detect_power()
+    if pkg:
+        print("功耗: 检测到 RAPL package 域 (%s)" % pkg)
+        if not os.access(os.path.join(pkg, "energy_uj"), os.R_OK):
+            print("  说明: energy_uj 为 root-only，由 root 采集器读取后写入缓存")
+    else:
+        print("功耗: 未检测到 RAPL package 域，面板将显示「本机不支持功耗读取」")
 
     plan = []
     new_nodes, msg_nodes = patch_nodes_pm(read_text(NODES_PM), disks, args.dry_run)

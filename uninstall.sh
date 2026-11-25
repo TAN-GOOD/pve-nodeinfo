@@ -19,6 +19,9 @@ die()  { printf '错误: %s\n' "$*" >&2; exit 1; }
 
 step "环境检查"
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行（sudo ./uninstall.sh）"
+if [ -f "$CONF_DIR/VERSION" ]; then
+    say "主机上的已安装版本: $(cat "$CONF_DIR/VERSION")"
+fi
 
 # ---------- 定位备份 ----------
 BK="${1:-}"

@@ -1,5 +1,5 @@
 [Unit]
-Description=Collect disk SMART data every 5 seconds for pve-nodeinfo
+Description=Collect pve-nodeinfo hardware data (SMART + power) every 5 seconds
 
 [Timer]
 OnBootSec=15

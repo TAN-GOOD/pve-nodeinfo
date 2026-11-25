@@ -123,7 +123,81 @@ chmod +s /usr/sbin/turbostat
 
 ---
 
-## 五、为什么不改 proxmoxlib.js
+## 五、v1.2.0：功耗的权限与换算
+
+磁盘那套「root 预采集 + 面板只读」的结论，在功耗上又被验证了一次 —— 而且这次连"换个工具"的余地都没有。
+
+### 取证
+
+| 步骤 | 观测 | 结论 |
+|---|---|---|
+| 1 | `lscpu` → `Intel(R) N100`；`lsmod` → `intel_rapl_msr`、`msr` 已加载 | 内核已提供 RAPL，**不需要装 `linux-cpupower`** |
+| 2 | `/sys/class/powercap/intel-rapl:0/name` = `package-0` | 顶层域存在，可直接读 `energy_uj` |
+| 3 | `ls -l energy_uj` → `-r-------- 1 root root` | `www-data` 连读都读不到，必须 root 采集 |
+| 4 | 5 秒差分 3 轮：`3.74 W` / `4.09 W` / `3.81 W` | 与 N100 空闲封装功耗吻合，数据可信 |
+| 5 | 同窗口 `psys` 恒为 `0.32 W` | **psys 域是退化值**，直接当整机功耗会显示一个比封装还小的数 |
+| 6 | 子域 `intel-rapl:0:0`(core)、`:0:1`(uncore) 的 `enabled` = `0` | 只取顶层 `package-0`，忽略子域 |
+
+第 5 条是这次最值得记的坑：`psys` 的语义是「平台总功耗」，理应 ≥ CPU 封装。实测 0.32 W 远小于 3.7 W，说明这块 N100 主板没有把 VR 电流信号引到 RAPL 的 psys 计数器上，驱动只能报一个几乎不变的退化值。**如果按"有 psys 就显示整机功耗"的常规写法，面板会给出一个物理上不可能的数字** —— 比不显示更糟。
+
+### 为什么不用 turbostat / cpupower
+
+| 方案 | 问题 |
+|---|---|
+| `turbostat` 打印 `PkgWatt` | 需要 root，且每次要 fork 一个进程 + 采集窗口（原社区脚本就是每请求 `turbostat` + `sleep 0.25`，这正是本项目要消除的开销）；本机甚至没装 |
+| `cpupower monitor` | 本质是 `msr` 的封装，仍需装包 |
+| **直接读 sysfs `energy_uj`（采用）** | 3 次文件读，微秒级，零依赖，与温度/频率采集方式一致 |
+
+### 差分算法
+
+`energy_uj` 是「自开机以来的累计微焦」，不是功率。要得到瓦特，必须有两次采样：
+
+```
+P(W) = ΔE(µJ) / Δt(s) / 1e6
+```
+
+麻烦在于 **采集器每 5 秒被 systemd 重新拉起一次，进程内没有状态**。三个选择：
+
+| 做法 | 取舍 |
+|---|---|
+| 进程内 `sleep 1` 采两次 | 每次采集多占 1 秒，与"降低开销"的初衷冲突；休眠时的时间跳变会算错 |
+| 常驻 daemon 保持内存状态 | 多一个常驻进程，systemd 单元和故障面都变复杂 |
+| **状态文件 + 单调时间戳（采用）** | 零额外等待，窗口正好是 timer 的间隔（更平滑），重启自愈 |
+
+状态文件 `/run/pve-nodeinfo/.power.state` 内容为 `<pkg_uj> <psys_uj|-> <ts_ns>`。放在 `/run` 是关键：tmpfs 重启即清空，而 RAPL 计数器也是开机归零 —— **两者生命周期天然一致**，不会拿重启前的累计值去减重启后的值。
+
+三个防护：
+
+| 情况 | 处理 |
+|---|---|
+| 计数器回绕（`ΔE < 0`） | 加上 `max_energy_range_uj` 折算；若仍为负则丢弃 |
+| 采样窗口 > 60 秒（手动停采、休眠恢复） | 丢弃本次，避免用超长窗口算出失真的平均功率 |
+| 结果 > 2000 W | 丢弃，防止回绕误算出现天文数字 |
+
+### psys 的可信性判据
+
+```sh
+psys_w >= pkg_w * 0.85   # 才采纳
+```
+
+物理上 `psys ≥ package`，留 15% 容差是为了容忍不同平台对 package 边界的定义差异。本机 `0.32 < 3.74 × 0.85` 直接被挡掉，`power.json` 里写 `"psys_w":null`，面板只显示封装功耗。换到 psys 正常的主板（如部分桌面平台）时，会自动多出「整机: xx W」，不需要改代码。
+
+### 面板状态机
+
+| `power.json` 内容 | 面板显示 | 出现时机 |
+|---|---|---|
+| 文件不存在 | `未知` | 刚开机、timer 尚未首次采集 |
+| `{"ok":false,"reason":"warmup"}` | `采集中...` | 首次采集只建立基线，第二次才有数（约 5 秒） |
+| `{"ok":false,"reason":"unsupported"}` | `本机不支持功耗读取` | 无 RAPL `package` 域（AMD 或极老平台） |
+| `{"ok":false,"reason":"unreadable"}` | `未知` | `energy_uj` 存在但读失败 |
+| `{"ok":true,"pkg_w":3.97,…}` | `4.0 W` | 正常 |
+| 同上且 `psys_w` 有效 | `4.0 W \| 整机: 14.2 W` | psys 域可信 |
+
+「warmup」这个中间态是必要的：如果首次采集就报 `ok`，只能写 0 W，会让用户以为机器不吃电。
+
+---
+
+## 六、为什么不改 proxmoxlib.js
 
 原脚本还会顺手去掉"无有效订阅"弹窗。本项目**完全跳过**这一步，原因有三：
 
@@ -133,7 +207,7 @@ chmod +s /usr/sbin/turbostat
 
 ---
 
-## 六、中文标签的编码问题
+## 七、中文标签的编码问题
 
 第一版实现直接让采集脚本输出中文标签（`主板: 27.8`），结果页面显示 `ä¸»æ¿: 27.8`。
 
@@ -150,16 +224,22 @@ Perl 侧验证: 反引号取回的是裸字节，未打 utf8 标志
 
 ---
 
-## 七、注入量与失败策略
+## 八、注入量与失败策略
 
 注入 `Nodes.pm` 的代码越少越好，因为那是 PVE 的核心 Perl 模块，改坏了 `pvedaemon` 起不来，整个 Web 界面都没了。
 
-v1.1.0 注入 2+N 个字段，**全部逻辑外置**：温度/频率调 `pve-hwinfo.sh`，磁盘只读缓存文件。
+v1.2.0 注入 3+N 个字段，**全部逻辑外置**：温度/频率调 `pve-hwinfo.sh`，功耗与磁盘只读缓存文件。
 
 ```perl
 #pve-nodeinfo
 $res->{thermalstate} = `/usr/local/bin/pve-hwinfo.sh thermal 2>/dev/null`;
 $res->{cpuFreq} = `/usr/local/bin/pve-hwinfo.sh cpu 2>/dev/null`;
+$res->{powerState} = do {
+    my $f = '/run/pve-nodeinfo/power.json';
+    my $c = '';
+    if (open(my $fh, '<', $f)) { local $/; $c = <$fh>; close($fh); }
+    $c // '';
+};
 $res->{sd0} = do {
     my $f = '/run/pve-nodeinfo/sd0.json';
     my $c = '';
@@ -183,7 +263,7 @@ $res->{sd0} = do {
 
 ---
 
-## 八、安全审查结论（针对本次实现）
+## 九、安全审查结论（针对本次实现）
 
 | 检查项 | 结论 |
 |---|---|

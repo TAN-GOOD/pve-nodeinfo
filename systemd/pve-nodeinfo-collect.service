@@ -1,5 +1,5 @@
 [Unit]
-Description=pve-nodeinfo disk SMART cache collector
+Description=pve-nodeinfo hardware cache collector (disk SMART + CPU package power)
 Documentation=https://github.com/TAN-GOOD/pve-nodeinfo
 After=local-fs.target
 Before=pveproxy.service
